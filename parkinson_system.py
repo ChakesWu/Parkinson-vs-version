@@ -371,15 +371,26 @@ def predict_rehabilitation_plan(input_data, device):
 def send_to_arduino(angles):
     """將角度數據發送到 Arduino"""
     try:
-        ser = Serial('COM3', 9600, timeout=1)  # 修改為 COM3
-        time.sleep(2)
-        angle_str = ",".join(map(str, angles.astype(int))) + "\n"
+        print("正在嘗試連接到 COM3...")
+        ser = Serial('COM3', 9600, timeout=1)
+        time.sleep(2)  # 等待 Arduino 準備好
+        # 清空串口緩衝區，避免接收舊數據
+        ser.flushInput()
+        angle_str = "ANGLES:" + ",".join(map(str, angles)) + "\n"
         print(f"準備發送的數據: {angle_str.strip()}")
         ser.write(angle_str.encode('utf-8'))
         print("數據發送成功！")
+        
+        # 增加延時並多次讀取回應
+        time.sleep(2)  # 等待 Arduino 處理並回應
+        for _ in range(10):  # 嘗試讀取 10 次
+            if ser.in_waiting > 0:
+                response = ser.readline().decode('utf-8').strip()
+                print(f"Arduino 回應: {response}")
+            time.sleep(0.1)
         ser.close()
     except Exception as e:
         print(f"發送到 Arduino 時出錯: {str(e)}")
-
+        
 if __name__ == "__main__":
     main()
