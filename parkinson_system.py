@@ -9,7 +9,7 @@ import time
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
-import serial
+from serial import Serial  # 正確導入 Serial
 
 # ==================== 數據生成與加載模塊 ====================
 def generate_base_dataset(samples=30000):
@@ -55,6 +55,8 @@ def load_csv_dataset(file_path):
 def combine_datasets(generated_df, csv_df):
     """合併生成數據和 CSV 數據"""
     combined_df = pd.concat([generated_df, csv_df], ignore_index=True)
+    combined_df['timestamp'] = combined_df['timestamp'].fillna(method='ffill')
+    combined_df['parkinson_label'] = combined_df['parkinson_label'].fillna(0)
     print("合併後的數據集總樣本數:", len(combined_df))
     print("標籤分佈:\n", combined_df['parkinson_label'].value_counts())
     return combined_df
@@ -127,7 +129,7 @@ class TransferLearningModel(nn.Module):
             nn.Linear(192, 64),
             nn.ReLU(),
             nn.Dropout(0.5),
-            nn.Linear(64, 5)  # 輸出5個值，對應5隻手指的角度
+            nn.Linear(64, 5)
         )
 
     def _initialize_weights(self):
@@ -141,11 +143,11 @@ class TransferLearningModel(nn.Module):
     def forward(self, x):
         features = self.encoder(x)
         angles = self.adapter(features)
-        return torch.sigmoid(angles) * 90  # 限制角度在 0-90 度
+        return torch.sigmoid(angles) * 90
 
 # ==================== 數據預處理 ====================
 class ParkinsonDataset(Dataset):
-    def __init__(self, df, seq_length=3000):
+    def __init__(self, df, seq_length=100):  # 修改為更小的 seq_length
         self.data = df.drop(columns=['timestamp', 'parkinson_label']).values
         self.labels = df['parkinson_label'].values
         self.seq_length = seq_length
@@ -161,6 +163,56 @@ class ParkinsonDataset(Dataset):
         seq = self.data[start:end].T
         label = int(self.labels[start:end].mean() > 0.5)
         return torch.FloatTensor(seq), torch.tensor(label, dtype=torch.long)
+
+# ==================== Arduino 數據收集與訓練方案生成 ====================
+def collect_data_from_arduino():
+    """從 Arduino 收集10秒的彎曲角度數據"""
+    try:
+        ser = Serial('COM3', 9600, timeout=1)  # 修改為 COM3
+        time.sleep(2)
+        ser.write(b"START\n")
+        print("已發送 START 命令")
+
+        data_received = False
+        while not data_received:
+            if ser.in_waiting > 0:
+                line = ser.readline().decode('utf-8').strip()
+                if line.startswith("DATA:"):
+                    data_str = line[5:]
+                    angles = list(map(float, data_str.split(',')[:-1]))
+                    print(f"接收到 {len(angles)} 個角度數據")
+                    data_received = True
+        ser.close()
+        return angles
+    except Exception as e:
+        print(f"從 Arduino 收集數據時出錯: {str(e)}")
+        return []
+
+def generate_training_plan(angles):
+    """根據彎曲角度數據生成訓練方案"""
+    avg_angle = sum(angles) / len(angles)
+    bending_speed = (max(angles) - min(angles)) / 10.0  # 10秒內變化速度 (度/秒)
+
+    # 帕金森患者特點：彎曲速度慢 (5-10 度/秒)，幅度小
+    normal_speed = 15.0  # 正常人彎曲速度
+    normal_max_angle = 90.0  # 正常人最大角度
+
+    if bending_speed < 5.0:
+        increment = 5
+    elif bending_speed < 10.0:
+        increment = 10
+    else:
+        increment = 15
+
+    base_angle = min(avg_angle + increment, normal_max_angle)
+    servo_angles = [
+        int(base_angle * 0.5),  # 拇指
+        int(base_angle * 0.7),  # 食指
+        int(base_angle * 0.9),  # 中指
+        int(base_angle * 0.7),  # 無名指
+        int(base_angle * 0.5)   # 小指
+    ]
+    return servo_angles
 
 # ==================== 訓練流程 ====================
 def main():
@@ -207,7 +259,7 @@ def main():
 
     print("\n===== 開始訓練 =====")
     best_loss = float('inf')
-    os.makedirs("models", exist_ok=True)  # 新增：確保 models 目錄存在
+    os.makedirs("models", exist_ok=True)
     for epoch in range(20):
         model.train()
         total_loss = 0.0
@@ -215,7 +267,7 @@ def main():
             inputs = inputs.to(device)
             optimizer.zero_grad()
             outputs = model(inputs)
-            target_angles = torch.rand(outputs.shape) * 90
+            target_angles = torch.rand(outputs.shape) * 90  # 使用隨機生成的目標角度
             target_angles = target_angles.to(device)
             loss = criterion(outputs, target_angles)
             if torch.isnan(loss):
@@ -234,7 +286,7 @@ def main():
             for inputs, _ in val_loader:
                 inputs = inputs.to(device)
                 outputs = model(inputs)
-                target_angles = torch.rand(outputs.shape) * 90
+                target_angles = torch.rand(outputs.shape) * 90  # 使用隨機生成的目標角度
                 target_angles = target_angles.to(device)
                 val_loss += criterion(outputs, target_angles).item()
 
@@ -251,27 +303,34 @@ def main():
             }, "models/best_model.pth")
             print("新的最佳模型已保存")
 
-    print("\n===== 生成康復方案並發送到 Arduino =====")
-    test_data = {
-        'timestamp': np.linspace(0, 300, 3000),
-        'finger_angle': 85 + 10 * np.sin(2 * np.pi * 5 * np.linspace(0, 1, 3000)),
-        'acceleration': 0.6 * np.exp(-0.005 * np.linspace(0, 300, 3000)),
-        'emg': 0.7 * np.abs(np.random.randn(3000)),
-        'parkinson_label': 1
-    }
-    plan = predict_rehabilitation_plan(test_data, device)
-    print("\n生成的帕金森手部訓練方案：")
-    for key, value in plan.items():
-        if isinstance(value, list):
-            print(f"- {key}:")
-            for item in value:
-                print(f"  * {item}")
-        else:
-            print(f"- {key}: {value}")
+    print("\n===== 從 Arduino 收集數據並生成康復方案 =====")
+    angles_from_arduino = collect_data_from_arduino()
+    if angles_from_arduino:
+        servo_angles = generate_training_plan(angles_from_arduino)
+        finger_names = ['拇指', '食指', '中指', '無名指', '小指']
+        plan = {
+            '手指鍛煉角度': [f"{finger_names[i]}: {servo_angles[i]} 度" for i in range(5)],
+            '注意事項': [
+                "訓練前後進行10分鐘熱敷/冷敷",
+                "每個動作間隔休息2分鐘",
+                "如出現疼痛或疲勞立即停止"
+            ]
+        }
+        send_to_arduino(servo_angles)
+        print("\n生成的帕金森手部訓練方案：")
+        for key, value in plan.items():
+            if isinstance(value, list):
+                print(f"- {key}:")
+                for item in value:
+                    print(f"  * {item}")
+            else:
+                print(f"- {key}: {value}")
+    else:
+        print("未接收到 Arduino 數據，無法生成訓練方案")
 
 # ==================== 推理模塊 ====================
 def predict_rehabilitation_plan(input_data, device):
-    """生成每隻手指的彎曲角度並發送到 Arduino"""
+    """生成每隻手指的彎曲角度並發送到 Arduino（基於模型預測）"""
     try:
         model = TransferLearningModel().to(device)
         checkpoint_path = "models/best_model.pth"
@@ -303,26 +362,24 @@ def predict_rehabilitation_plan(input_data, device):
                 "如出現疼痛或疲勞立即停止"
             ]
         }
-
         send_to_arduino(angles)
         return plan
-
     except Exception as e:
         print(f"生成方案時出錯: {str(e)}")
         return {"error": "無法生成訓練方案"}
 
 def send_to_arduino(angles):
+    """將角度數據發送到 Arduino"""
     try:
-        print("正在尝试连接 COM3...")
-        ser = serial.Serial('COM3', 9600, timeout=1)
-        time.sleep(2)  # 等待 Arduino 初始化
+        ser = Serial('COM3', 9600, timeout=1)  # 修改為 COM3
+        time.sleep(2)
         angle_str = ",".join(map(str, angles.astype(int))) + "\n"
-        print(f"准备发送的数据: {angle_str.strip()}")  # 打印发送的数据
+        print(f"準備發送的數據: {angle_str.strip()}")
         ser.write(angle_str.encode('utf-8'))
+        print("數據發送成功！")
         ser.close()
-        print("数据发送成功！")
     except Exception as e:
-        print(f"发送到 Arduino 时出错: {str(e)}")
+        print(f"發送到 Arduino 時出錯: {str(e)}")
 
 if __name__ == "__main__":
     main()
