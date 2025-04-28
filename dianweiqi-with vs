@@ -1,0 +1,64 @@
+#include <Arduino.h>
+
+#define PIN_PINKY     A0
+#define PIN_RING      A1
+#define PIN_MIDDLE    A2
+#define PIN_INDEX     A3
+#define PIN_THUMB     A4
+
+// 通信协议参数
+const unsigned long SAMPLE_RATE = 100;  // 采样间隔(ms)
+const unsigned long BASELINE_DURATION = 2000;  // 基准校准时长(ms)
+
+void setup() {
+    Serial.begin(9600);  // 必须与Python端波特率一致
+    while (!Serial);      // 等待串口连接
+}
+
+void loop() {
+    if (Serial.available()) {
+        String cmd = Serial.readStringUntil('\n');
+        cmd.trim();
+
+        if (cmd == "START") {
+            // 基准校准阶段
+            float baseline[5] = {0};
+            unsigned long startTime = millis();
+            int sampleCount = 0;
+            
+            while (millis() - startTime < BASELINE_DURATION) {
+                baseline[0] += analogRead(PIN_PINKY);
+                baseline[1] += analogRead(PIN_RING);
+                baseline[2] += analogRead(PIN_MIDDLE);
+                baseline[3] += analogRead(PIN_INDEX);
+                baseline[4] += analogRead(PIN_THUMB);
+                sampleCount++;
+                delay(SAMPLE_RATE);
+            }
+            for (int i=0; i<5; i++) baseline[i] /= sampleCount;
+
+            // 数据采集阶段
+            startTime = millis();
+            while (millis() - startTime < 10000) {  // 采集10秒
+                int values[5] = {
+                    analogRead(PIN_PINKY) - baseline[0],
+                    analogRead(PIN_RING) - baseline[1],
+                    analogRead(PIN_MIDDLE) - baseline[2],
+                    analogRead(PIN_INDEX) - baseline[3],
+                    analogRead(PIN_THUMB) - baseline[4]
+                };
+
+                // 发送数据包协议: DATA,value1,value2,...value5
+                Serial.print("DATA");
+                for (int i=0; i<5; i++) {
+                    Serial.print(",");
+                    Serial.print(values[i]);
+                }
+                Serial.println();  // 换行作为结束符
+                
+                delay(SAMPLE_RATE);
+            }
+            Serial.println("END");  // 结束标记
+        }
+    }
+}
