@@ -10,30 +10,45 @@ from serial import Serial
 import time
 from model import TransferLearningModel, ParkinsonDataset
 from data_processing import kinematic_feature_engineering
+com = 'COM3'  # 替換為你的 Arduino 端口號
 
 def collect_data_from_arduino():
-    """從 Arduino 收集10秒的彎曲角度數據"""
+    """从Arduino采集带基准校准的数据"""
     try:
-        ser = Serial('COM6', 9600, timeout=1)
+        ser = Serial('COM3', 9600, timeout=2)
+        ser.flushInput()
+        
+        # 等待Arduino初始化完成
         time.sleep(2)
+        
+        # 发送启动命令
         ser.write(b"START\n")
-        print("已發送 START 命令")
+        print("已发送启动命令")
 
-        data_received = False
-        while not data_received:
-            if ser.in_waiting > 0:
-                line = ser.readline().decode('utf-8').strip()
-                if line.startswith("DATA:"):
-                    data_str = line[5:]
-                    angles = list(map(float, data_str.split(',')[:-1]))
-                    print(f"接收到 {len(angles)} 個角度數據")
-                    data_received = True
+        angles = []
+        start_collect = False
+        
+        # 数据接收循环
+        start_time = time.time()
+        while (time.time() - start_time) < 15:  # 超时保护
+            line = ser.readline().decode().strip()
+            
+            if line.startswith("DATA,"):
+                # 解析数据格式: DATA,val1,val2,val3,val4,val5
+                values = list(map(int, line.split(',')[1:6]))
+                angles.extend(values)  # 将五个手指数据加入列表
+                
+            elif line == "END":
+                print("数据接收完成")
+                break
+
         ser.close()
-        return angles
+        return angles[-50:]  # 取最后50个数据点（假设10Hz采样）
+    
     except Exception as e:
-        print(f"從 Arduino 收集數據時出錯: {str(e)}")
+        print(f"数据采集错误: {str(e)}")
         return []
-
+    
 def generate_training_plan(angles):
     """根據彎曲角度數據生成訓練方案"""
     avg_angle = sum(angles) / len(angles)
@@ -59,7 +74,7 @@ def generate_training_plan(angles):
 def send_to_arduino(angles):
     """將角度數據發送到 Arduino"""
     try:
-        ser = Serial('COM6', 9600, timeout=1)
+        ser = Serial('com', 9600, timeout=1)
         time.sleep(2)
         ser.flushInput()
         angle_str = "ANGLES:" + ",".join(map(str, angles)) + "\n"
