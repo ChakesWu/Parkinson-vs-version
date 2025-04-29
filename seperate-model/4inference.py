@@ -226,17 +226,28 @@ def send_to_arduino(angles):
 
 def predict_rehabilitation_plan(input_data=None, use_arduino=False):
     """生成每隻手指的彎曲角度並發送到 Arduino"""
-    device = torch.device("cpu")
-    model = TransferLearningModel().to(device)
+    # 使用OpenVINO進行推理加速
+    from openvino.tools.pytorch import convert_model
+    from openvino.runtime import Core
+    
+    # 加載原始PyTorch模型
+    model = TransferLearningModel()
     checkpoint_path = "models/best_model.pth"
     if os.path.exists(checkpoint_path):
-        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
         model.load_state_dict(checkpoint['model_state_dict'])
         print("最佳模型權重加載成功")
     else:
         print("未找到最佳模型權重，使用隨機初始化的模型")
-
+    
     model.eval()
+    
+    # 轉換為OpenVINO格式
+    ov_model = convert_model(model, example_input=torch.randn(1, 5, 100))  # 假設輸入形狀為(1,5,100)
+    
+    # 初始化OpenVINO核心
+    core = Core()
+    compiled_model = core.compile_model(ov_model, "GPU")  # 使用Intel GPU
     baseline = []
     final_angles = []
     servo_angles = []
@@ -257,8 +268,10 @@ def predict_rehabilitation_plan(input_data=None, use_arduino=False):
         loader = DataLoader(dataset, batch_size=1)
         with torch.no_grad():
             inputs, _ = next(iter(loader))
-            inputs = inputs.to(device)
-            servo_angles = model(inputs).cpu().numpy()[0]
+            # 使用OpenVINO進行推理
+            inputs_np = inputs.numpy()  # 轉換為numpy數組
+            results = compiled_model([inputs_np])[0]
+            servo_angles = results[0]  # 獲取第一個輸出
             if np.isnan(servo_angles).any():
                 raise ValueError("模型輸出包含 NaN")
 
